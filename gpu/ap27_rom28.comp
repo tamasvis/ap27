@@ -1,0 +1,182 @@
+#version 450
+
+// AP27 CRT/ROM-batch sieve -- Vulkan compute port of ../cpu/ap27_crt_sieve.c.
+// SPDX-License-Identifier: BSD-3-Clause
+//
+// See the top-level README for the design rationale (residue-indexed
+// masks, why 32 primes, why this beats a recomputed-per-position
+// bitmask). This file adapts the same mechanism for wide parallel
+// dispatch: one GPU invocation evaluates one 512-candidate batch, using
+// exactly the ROM table + AND-reduce shape the CPU version does, just
+// across thousands of invocations at once.
+//
+// LOCAL_SIZE_X and HIT_CAP below MUST match the host driver's own copies
+// of these constants exactly. A mismatch silently under- or
+// over-dispatches invocations (or overflows the hit buffer) with NO
+// error from the Vulkan API -- a real failure mode, not a hypothetical
+// one, which is why both constants are called out explicitly here
+// rather than left as unlabeled literals.
+#define LOCAL_SIZE_X 64u
+layout(local_size_x = LOCAL_SIZE_X) in;
+
+#define NP      28u
+#define WORDS   16u    // 512 bits / 32
+#define HIT_CAP 8192u  // must match the host driver's HIT_CAP exactly
+
+layout(push_constant) uniform PushConsts {
+	uint chunkLen;  // real invocation count this dispatch covers (<= group
+	                // count * LOCAL_SIZE_X; the host rounds workgroups up
+	                // to a whole multiple of LOCAL_SIZE_X, so the tail of
+	                // the last group can be padding past chunkLen)
+} pc;
+
+// Same CRT-merge design as ../cpu/ap27_crt_sieve.c: the 7 primes
+// dividing C (5,7,11,13,17,19,23) are CRT-merged into 3 combined-modulus
+// groups {5,7,11}->385, {13,23}->299, {17,19}->323 -- each merged "slot"
+// is looked up and ANDed exactly like a real prime's table, just with a
+// larger modulus and a "divisible by none of the group's primes"
+// goodness predicate baked in host-side (see the driver's ROM builder).
+// Reduces per-invocation lookups from 32 to 28 -- same real prime
+// coverage, fewer lookup+AND steps. Whether lookup+AND is actually the
+// GPU's dominant cost has not been separately profiled: the measured
+// ~6.8% throughput win from this merge is well under the ~27% a
+// lookup-bound model predicts from the early-exit checkpoint's own
+// measured fire rate, so something else -- the remaining per-slot
+// "% P" below, the per-invocation atomicAdd(completed_count), or fixed
+// per-invocation overhead -- likely dominates GPU time. See the
+// top-level README's "Merging small primes" section for the numbers;
+// the CPU-side "bitmask-AND throughput is the ceiling" framing there
+// is CPU-specific and does not carry over to the GPU port as-is.
+// Table size grows accordingly (147.6KB -> 204.6KB, matching the CPU
+// design's own real merged-table size exactly).
+const uint PRIMES[NP] = uint[NP](
+	385u, 299u, 323u,
+	37u, 41u, 43u, 47u, 53u, 59u, 61u, 67u, 71u, 73u, 79u, 83u, 89u, 97u,
+	101u, 103u, 107u, 109u, 113u, 127u, 131u, 137u, 139u, 149u, 151u);
+
+// Word (uint32) offset of each slot's own table within the flat
+// RomTable buffer below (cumulative sum of slot_modulus*WORDS over
+// PRIMES[0..p-1]) -- e.g. ROM_OFFSET[1] = 6160 = 385 * WORDS.
+const uint ROM_OFFSET[NP] = uint[NP](
+	0u, 6160u, 10944u,
+	16112u, 16704u, 17360u, 18048u, 18800u, 19648u, 20592u, 21568u, 22640u,
+	23776u, 24944u, 26208u, 27536u, 28960u, 30512u, 32128u, 33776u, 35488u,
+	37232u, 39040u, 41072u, 43168u, 45360u, 47584u, 49968u);
+
+layout(std430, binding = 0) readonly buffer RomTable {
+	uint romTable[];         // flat, all 28 slots' tables concatenated -- B-dependent content
+};
+layout(std430, binding = 1) readonly buffer Baseline0 {
+	uint baseline0[NP];      // A0 mod P, per prime -- this dispatch's start, B/A0-dependent
+};
+layout(std430, binding = 2) readonly buffer AdvanceModP {
+	uint advanceModP[NP];    // (32*5394) mod P, host-precomputed -- a per-prime CONSTANT
+	                         // (the CPU driver hardcodes the same values as TABLE_PRIME_ADVANCE[]),
+	                         // not B-dependent; only baseline0[] depends on B/A0.
+};
+layout(std430, binding = 3) buffer HitCount {
+	uint hit_count;          // atomic total; caller pre-inits to 0
+};
+layout(std430, binding = 4) buffer HitBatch {
+	uint hit_batch[HIT_CAP]; // batch index of each hit
+};
+layout(std430, binding = 5) buffer HitPos {
+	uint hit_pos[HIT_CAP];   // bit position (0..511) within that batch
+};
+layout(std430, binding = 6) buffer Completed {
+	// Atomic, unconditional per-invocation increment. GPU driver
+	// watchdogs can silently truncate a long-running dispatch while
+	// still reporting success at the API level -- comparing the final
+	// completed_count against the number of invocations actually
+	// requested is how the host distinguishes "this chunk really did
+	// finish" from "the driver killed it partway through", even when
+	// the truncated chunk happened to produce zero hits (which
+	// hit_count alone can never tell apart from a genuinely quiet one).
+	uint completed_count;
+};
+
+void main()
+{
+	atomicAdd(completed_count, 1u);
+	// Real invocation count is never exactly a multiple of LOCAL_SIZE_X
+	// (CHUNK_BATCHES=2,500,000 isn't one), so the host always rounds its
+	// workgroup count up and over-dispatches by a few invocations past
+	// the real chunk. Without this check, those extra invocations would
+	// silently compute and report hits for batch indices that belong to
+	// the NEXT chunk, double-scanning them. completed_count is still
+	// incremented for every dispatched invocation, padding included --
+	// it tracks "did the GPU run everything it was asked to", which the
+	// padding is part of.
+	if (gl_GlobalInvocationID.x >= pc.chunkLen)
+		return;
+	// batchIdx is always CHUNK-RELATIVE: every caller pushes chunkLen and
+	// reconstructs each hit's real absolute batch (abs_batch = off +
+	// hit_batch[i], with a host-side 64-bit off) the same way, whether
+	// it reads hits back once (a single-chunk KAT run) or once per chunk
+	// (a long unattended search). One convention, not two drivers each
+	// assuming a different meaning for this value.
+	uint batchIdx = gl_GlobalInvocationID.x;
+	uint combined[WORDS];
+	for (uint w = 0; w < WORDS; w++)
+		combined[w] = 0xFFFFFFFFu;
+
+	// Checkpointed early-out: only makes sense at whole-invocation
+	// granularity (a GPU thread returning early doesn't cost other
+	// lanes anything unless the rest of its wavefront disagrees), and
+	// only after the highest-yield (smallest) primes -- the per-prime
+	// rejection rate is roughly 27/P, so it's largest for the smallest
+	// primes and falls off fast. The checkpoint covers the 7 small
+	// primes/group slots plus the first 9 table primes (37..71): 16
+	// slots pre-merge, 12 slots (3 group + 9 table) post-merge -- same
+	// underlying prime coverage either way, since merging doesn't change
+	// which primes are checked, only how many lookups it takes. Measured
+	// fire rate (all-zero after this checkpoint) over a real B: ~82% --
+	// see the top-level README's "Merging small primes" section.
+	// baseline0[p] is the CHUNK's own starting residue (host recomputes
+	// it per chunk as (A0_baseline0[p] + this_chunk's_offset*advanceModP[p])
+	// mod P before each dispatch -- see the driver), so the per-invocation
+	// residue is just baseline0[p] + gl_GlobalInvocationID.x*advanceModP[p]
+	// -- no live "batchIdx % P" needed. Removes one of the two real mod
+	// ops per prime per invocation (28 total), batch-size-independent.
+	// Verified algebraically (the fold is a standard modular-arithmetic
+	// identity) and against all 4 real KATs via this file's own
+	// fixed-nbatches driver (byte-for-byte identical survivor lists, no
+	// wall-clock timing variance). The remaining outer "% P" is a
+	// separate, larger undertaking (Barrett/Dhem-style reduction) --
+	// not attempted here.
+	for (uint p = 0; p < 12u; p++) {
+		uint P = PRIMES[p];
+		uint b = (baseline0[p] + gl_GlobalInvocationID.x * advanceModP[p]) % P;
+		uint off = ROM_OFFSET[p] + b * WORDS;
+		for (uint w = 0; w < WORDS; w++)
+			combined[w] &= romTable[off + w];
+	}
+
+	uint acc = 0u;
+	for (uint w = 0; w < WORDS; w++)
+		acc |= combined[w];
+	if (acc == 0u)
+		return;
+
+	for (uint p = 12u; p < NP; p++) {
+		uint P = PRIMES[p];
+		uint b = (baseline0[p] + gl_GlobalInvocationID.x * advanceModP[p]) % P;
+		uint off = ROM_OFFSET[p] + b * WORDS;
+		for (uint w = 0; w < WORDS; w++)
+			combined[w] &= romTable[off + w];
+	}
+
+	for (uint w = 0; w < WORDS; w++) {
+		uint bits = combined[w];
+		while (bits != 0u) {
+			uint bit = findLSB(bits);
+			uint pos = w * 32u + bit;
+			uint idx = atomicAdd(hit_count, 1u);
+			if (idx < HIT_CAP) {
+				hit_batch[idx] = batchIdx;
+				hit_pos[idx] = pos;
+			}
+			bits &= bits - 1u;
+		}
+	}
+}

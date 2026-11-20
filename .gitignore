@@ -1,0 +1,11 @@
+# compiled GPU shader -- always regenerable via glslc, never hand-written
+*.spv
+
+# binaries built by Makefile (ap27_prefilter256_selftest is the one
+# built under a different name than its .c file, ap27_prefilter256.c)
+cpu/ap27_crt_sieve
+gpu/ap27_rom28_kat
+gpu/ap27_rom28_search
+presieve/ap27_prefilter256_selftest
+presieve/prefilter256_cli
+presieve/ap27_log_decimator
